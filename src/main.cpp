@@ -1,3 +1,7 @@
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <chrono>
 #include <utils/proto/rigctl.h>
 #include <imgui.h>
 #include <module.h>
@@ -5,11 +9,8 @@
 #include <gui/style.h>
 #include <signal_path/signal_path.h>
 #include <core.h>
-#include <recorder_interface.h>
-#include <meteor_demodulator_interface.h>
 #include <config.h>
 #include <cctype>
-#include <radio_interface.h>
 #define CONCAT(a, b) ((std::string(a) + b).c_str())
 
 SDRPP_MOD_INFO{
@@ -22,9 +23,9 @@ SDRPP_MOD_INFO{
 
 ConfigManager config;
 
-class RigctlClientModule : public ModuleManager::Instance {
+class BiDiRigctlClientModule : public ModuleManager::Instance {
 public:
-    RigctlClientModule(std::string name) {
+    BiDiRigctlClientModule(std::string name) {
         this->name = name;
 
         // Load default
@@ -48,12 +49,23 @@ public:
         _retuneHandler.ctx = this;
         _retuneHandler.handler = retuneHandler;
 
+        workerRunning = true;
+        workerThread = std::thread(&BiDiRigctlClientModule::worker, this);
+
         gui::menu.registerEntry(name, menuHandler, this, NULL);
     }
 
-    ~RigctlClientModule() {
+    ~BiDiRigctlClientModule() {
         stop();
         gui::menu.removeEntry(name);
+
+        // let worker know we're shutting down
+        std::unique_lock cv_lk(workerMutex);
+        workerRunning = false;
+        cv_lk.unlock();
+        cv.notify_all();
+
+        if (workerThread.joinable()) { workerThread.join(); }
     }
 
     void postInit() {
@@ -109,7 +121,7 @@ public:
 
 private:
     static void menuHandler(void* ctx) {
-        RigctlClientModule* _this = (RigctlClientModule*)ctx;
+        BiDiRigctlClientModule* _this = (BiDiRigctlClientModule*)ctx;
         float menuWidth = ImGui::GetContentRegionAvail().x;
 
         if (_this->running) { style::beginDisabled(); }
@@ -148,22 +160,68 @@ private:
 
         ImGui::TextUnformatted("Status:");
         ImGui::SameLine();
-        if (_this->client && _this->client->isOpen() && _this->running) {
-            ImGui::TextColored(ImVec4(0.0, 1.0, 0.0, 1.0), "Connected");
-        }
-        else if (_this->client && _this->running) {
-            ImGui::TextColored(ImVec4(1.0, 1.0, 0.0, 1.0), "Disconnected");
-        }
-        else {
-            ImGui::TextUnformatted("Idle");
+        {
+            //protect access to the client by mtx
+            std::lock_guard<std::recursive_mutex> lck(_this->mtx);
+            if (_this->client && _this->client->isOpen() && _this->running) {
+                ImGui::TextColored(ImVec4(0.0, 1.0, 0.0, 1.0), "Connected");
+            }
+            else if (_this->client && _this->running) {
+                ImGui::TextColored(ImVec4(1.0, 1.0, 0.0, 1.0), "Disconnected");
+            }
+            else {
+                ImGui::TextUnformatted("Idle");
+            }
         }
     }
 
     static void retuneHandler(double freq, void* ctx) {
-        RigctlClientModule* _this = (RigctlClientModule*)ctx;
+        BiDiRigctlClientModule* _this = (BiDiRigctlClientModule*)ctx;
+        std::lock_guard<std::recursive_mutex> lck(_this->mtx);
+        _this->waterfallFrequency = freq;
         if (!_this->client || !_this->client->isOpen()) { return; }
+        if (_this->waterfallFrequency == _this->rigFrequency) { return; }
         if (_this->client->setFreq(freq)) {
             flog::error("Could not set frequency");
+        }
+    }
+
+    void worker() {
+        // a comment in discord_integration claims SDR++ author is working on a
+        // timer which we should probably be using instead of having a thread
+        // wake up periodically
+        std::unique_lock cv_lk(workerMutex);
+        while (workerRunning) {
+            {
+                // synchronize state with the rig
+                std::lock_guard<std::recursive_mutex> lck(mtx);
+                if(running) {
+                    double newFreq = client->getFreq();
+                    if(newFreq < 0) {
+                        flog::error("Could not get frequency from rig");
+                    } else {
+                        rigFrequency = newFreq;
+                        if(rigFrequency != waterfallFrequency) {
+                            //TODO: handle multiple VFOs?
+                            //TODO: what's the right way to use ifFreq?
+                            // we don't know what the radio's actual IF freq is
+                            // so we're just approximating it
+                            // this feels janky
+                            if(abs(rigFrequency - ifFreq) > 500000) {
+                                ifFreq = rigFrequency;
+                                sigpath::sourceManager.setPanadpterIF(ifFreq);
+                                config.acquire();
+                                config.conf[name]["ifFreq"] = ifFreq;
+                                config.release(true);
+                            }
+                            tuner::tune(tuner::TUNER_MODE_NORMAL, gui::waterfall.selectedVFO, rigFrequency);
+                            // we will set waterfallFrequency to the new
+                            // frequency when we get the retune callback
+                        }
+                    }
+                }
+            }
+            cv.wait_for(cv_lk, std::chrono::milliseconds(250));
         }
     }
 
@@ -179,6 +237,15 @@ private:
     double ifFreq = 8830000.0;
 
     EventHandler<double> _retuneHandler;
+
+    double rigFrequency;
+    double waterfallFrequency;
+
+    // Threading
+    std::thread workerThread;
+    bool workerRunning;
+    std::condition_variable cv;
+    std::mutex workerMutex;
 };
 
 MOD_EXPORT void _INIT_() {
@@ -188,11 +255,11 @@ MOD_EXPORT void _INIT_() {
 }
 
 MOD_EXPORT ModuleManager::Instance* _CREATE_INSTANCE_(std::string name) {
-    return new RigctlClientModule(name);
+    return new BiDiRigctlClientModule(name);
 }
 
 MOD_EXPORT void _DELETE_INSTANCE_(void* instance) {
-    delete (RigctlClientModule*)instance;
+    delete (BiDiRigctlClientModule*)instance;
 }
 
 MOD_EXPORT void _END_() {
