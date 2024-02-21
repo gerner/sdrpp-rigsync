@@ -21,6 +21,10 @@ SDRPP_MOD_INFO{
     /* Max instances    */ 1
 };
 
+bool almost_equal(double a, double b, double epsilon=1e-3) {
+    return abs(a-b) < epsilon;
+}
+
 ConfigManager config;
 
 class BiDiRigctlClientModule : public ModuleManager::Instance {
@@ -41,16 +45,13 @@ public:
             port = config.conf[name]["port"];
             port = std::clamp<int>(port, 1, 65535);
         }
-        if (config.conf[name].contains("ifFreq")) {
-            ifFreq = config.conf[name]["ifFreq"];
-        }
+        //if (config.conf[name].contains("ifFreq")) {
+        //    ifFreq = config.conf[name]["ifFreq"];
+        //}
         config.release();
 
-        _retuneHandler.ctx = this;
-        _retuneHandler.handler = retuneHandler;
-
-        workerRunning = true;
-        workerThread = std::thread(&BiDiRigctlClientModule::worker, this);
+        //_retuneHandler.ctx = this;
+        //_retuneHandler.handler = retuneHandler;
 
         gui::menu.registerEntry(name, menuHandler, this, NULL);
     }
@@ -59,13 +60,6 @@ public:
         stop();
         gui::menu.removeEntry(name);
 
-        // let worker know we're shutting down
-        std::unique_lock cv_lk(workerMutex);
-        workerRunning = false;
-        cv_lk.unlock();
-        cv.notify_all();
-
-        if (workerThread.joinable()) { workerThread.join(); }
     }
 
     void postInit() {
@@ -97,10 +91,17 @@ public:
             return;
         }
 
+        // clear known state, the worker thread will handle synchronization
+        waterfallFrequency = -1;
+        rigFrequency = -2;
+
+        workerRunning = true;
+        workerThread = std::thread(&BiDiRigctlClientModule::worker, this);
+
         // Switch source to panadapter mode
-        sigpath::sourceManager.setPanadpterIF(ifFreq);
-        sigpath::sourceManager.setTuningMode(SourceManager::TuningMode::PANADAPTER);
-        sigpath::sourceManager.onRetune.bindHandler(&_retuneHandler);
+        //sigpath::sourceManager.setPanadpterIF(ifFreq);
+        //sigpath::sourceManager.setTuningMode(SourceManager::TuningMode::PANADAPTER);
+        //sigpath::sourceManager.onRetune.bindHandler(&_retuneHandler);
 
         running = true;
     }
@@ -109,9 +110,18 @@ public:
         std::lock_guard<std::recursive_mutex> lck(mtx);
         if (!running) { return; }
 
+        // let worker know we're shutting down
+        {
+            std::unique_lock cv_lk(workerMutex);
+            workerRunning = false;
+            cv_lk.unlock();
+            cv.notify_all();
+            if (workerThread.joinable()) { workerThread.join(); }
+        }
+
         // Switch source back to normal mode
-        sigpath::sourceManager.onRetune.unbindHandler(&_retuneHandler);
-        sigpath::sourceManager.setTuningMode(SourceManager::TuningMode::NORMAL);
+        //sigpath::sourceManager.onRetune.unbindHandler(&_retuneHandler);
+        //sigpath::sourceManager.setTuningMode(SourceManager::TuningMode::NORMAL);
 
         // Disconnect from rigctl server
         client->close();
@@ -139,16 +149,16 @@ private:
         }
         if (_this->running) { style::endDisabled(); }
 
-        ImGui::LeftLabel("IF Frequency");
+        /*ImGui::LeftLabel("IF Frequency");
         ImGui::FillWidth();
         if (ImGui::InputDouble(CONCAT("##_rigctl_if_freq_", _this->name), &_this->ifFreq, 100.0, 100000.0, "%.0f")) {
             if (_this->running) {
-                sigpath::sourceManager.setPanadpterIF(_this->ifFreq);
+                //sigpath::sourceManager.setPanadpterIF(_this->ifFreq);
             }
             config.acquire();
             config.conf[_this->name]["ifFreq"] = _this->ifFreq;
             config.release(true);
-        }
+        }*/
 
         ImGui::FillWidth();
         if (_this->running && ImGui::Button(CONCAT("Stop##_rigctl_cli_stop_", _this->name), ImVec2(menuWidth, 0))) {
@@ -175,50 +185,90 @@ private:
         }
     }
 
-    static void retuneHandler(double freq, void* ctx) {
+    /*static void retuneHandler(double freq, void* ctx) {
+        flog::info("retune {0}", freq);
         BiDiRigctlClientModule* _this = (BiDiRigctlClientModule*)ctx;
         std::lock_guard<std::recursive_mutex> lck(_this->mtx);
         _this->waterfallFrequency = freq;
         if (!_this->client || !_this->client->isOpen()) { return; }
-        if (_this->waterfallFrequency == _this->rigFrequency) { return; }
+        if (almost_equal(_this->waterfallFrequency, _this->rigFrequency)) { return; }
+        flog::info("tuning rig to {0}", freq);
         if (_this->client->setFreq(freq)) {
             flog::error("Could not set frequency");
         }
+    }*/
+
+    bool syncWaterfallWithRig() {
+        //checks if we have a new rig frequency and sets the waterfall to that
+
+        // synchronize rig -> waterfall
+        double newFreq = client->getFreq();
+        if(newFreq < 0) {
+            flog::error("Could not get frequency from rig");
+            return false;
+        } else if(!almost_equal(rigFrequency, newFreq)) {
+            rigFrequency = newFreq;
+            if(!almost_equal(rigFrequency, waterfallFrequency)) {
+                //TODO: handle multiple VFOs?
+                //TODO: what's the right way to use ifFreq?
+                // we don't know what the radio's actual IF freq is
+                // so we're just approximating it
+                // this feels janky
+                /*if(abs(rigFrequency - ifFreq) > 500000) {
+                    ifFreq = rigFrequency;
+                    sigpath::sourceManager.setPanadpterIF(ifFreq);
+                    config.acquire();
+                    config.conf[name]["ifFreq"] = ifFreq;
+                    config.release(true);
+                }*/
+                flog::info("tuning waterfall to {0}", rigFrequency);
+                tuner::tune(tuner::TUNER_MODE_NORMAL, gui::waterfall.selectedVFO, rigFrequency);
+                waterfallFrequency = rigFrequency;
+            }
+        } // else there's no change in rig freq, assume we're in sync
+        if(waterfallFrequency != rigFrequency) {
+            flog::error("waterfall and rig are out of sync!");
+        }
+        return true;
+    }
+
+    bool syncRigWithWaterfall() {
+        //checks if we have a new waterfall frequency and sets the rig to that
+
+        // from rigctl_server
+        // Get center frequency of the SDR
+        double newFreq = gui::waterfall.getCenterFrequency();
+        // Add the offset of the VFO if it exists
+        newFreq += sigpath::vfoManager.getOffset(gui::waterfall.selectedVFO);
+
+        if(!almost_equal(waterfallFrequency, newFreq)) {
+            waterfallFrequency = newFreq;
+            if(!almost_equal(waterfallFrequency, rigFrequency)) {
+                flog::info("tuning radio to {0}", waterfallFrequency);
+                if (client->setFreq(waterfallFrequency)) {
+                    flog::error("Could not set rig frequency");
+                    return false;
+                }
+                rigFrequency = waterfallFrequency;
+            }
+        } // else there's no change in waterfall freq, assume we're in sync
+        if(waterfallFrequency != rigFrequency) {
+            flog::error("waterfall and rig are out of sync!");
+        }
+        return true;
     }
 
     void worker() {
-        // a comment in discord_integration claims SDR++ author is working on a
-        // timer which we should probably be using instead of having a thread
-        // wake up periodically
+        // this is a pure polling approach: we poll both the rig and the
+        // waterfall for changes since the last time we checked
         std::unique_lock cv_lk(workerMutex);
         while (workerRunning) {
             {
                 // synchronize state with the rig
                 std::lock_guard<std::recursive_mutex> lck(mtx);
                 if(running) {
-                    double newFreq = client->getFreq();
-                    if(newFreq < 0) {
-                        flog::error("Could not get frequency from rig");
-                    } else {
-                        rigFrequency = newFreq;
-                        if(rigFrequency != waterfallFrequency) {
-                            //TODO: handle multiple VFOs?
-                            //TODO: what's the right way to use ifFreq?
-                            // we don't know what the radio's actual IF freq is
-                            // so we're just approximating it
-                            // this feels janky
-                            if(abs(rigFrequency - ifFreq) > 500000) {
-                                ifFreq = rigFrequency;
-                                sigpath::sourceManager.setPanadpterIF(ifFreq);
-                                config.acquire();
-                                config.conf[name]["ifFreq"] = ifFreq;
-                                config.release(true);
-                            }
-                            tuner::tune(tuner::TUNER_MODE_NORMAL, gui::waterfall.selectedVFO, rigFrequency);
-                            // we will set waterfallFrequency to the new
-                            // frequency when we get the retune callback
-                        }
-                    }
+                    syncWaterfallWithRig();
+                    syncRigWithWaterfall();
                 }
             }
             cv.wait_for(cv_lk, std::chrono::milliseconds(250));
@@ -234,9 +284,9 @@ private:
     int port = 4532;
     std::shared_ptr<net::rigctl::Client> client;
 
-    double ifFreq = 8830000.0;
+    //double ifFreq = 8830000.0;
 
-    EventHandler<double> _retuneHandler;
+    //EventHandler<double> _retuneHandler;
 
     double rigFrequency;
     double waterfallFrequency;
