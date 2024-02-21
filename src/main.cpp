@@ -299,7 +299,7 @@ private:
 };
 
 MOD_EXPORT void _INIT_() {
-    config.setPath(core::args["root"].s() + "/rigctl_client_config.json");
+    config.setPath(core::args["root"].s() + "/sdrpp_rigctl_client_config.json");
     config.load(json::object());
     config.enableAutoSave();
 }
