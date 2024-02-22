@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.13)
-project(sdrpp-rigctl-client)
+project(sdrpp-rigsync)
 
 file(GLOB SRC "src/*.cpp")
 

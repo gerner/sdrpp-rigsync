@@ -14,9 +14,9 @@
 #define CONCAT(a, b) ((std::string(a) + b).c_str())
 
 SDRPP_MOD_INFO{
-    /* Name:            */ "sdrpp-rigctl-client",
-    /* Description:     */ "Client for the RigCTL protocol",
-    /* Author:          */ "Ryzerth;gener",
+    /* Name:            */ "sdrpp-rigsync",
+    /* Description:     */ "Synchronizes frequency across a rig and SDR++",
+    /* Author:          */ "gener",
     /* Version:         */ 0, 1, 0,
     /* Max instances    */ 1
 };
@@ -27,9 +27,9 @@ bool almost_equal(double a, double b, double epsilon=1e-3) {
 
 ConfigManager config;
 
-class BiDiRigctlClientModule : public ModuleManager::Instance {
+class RigSyncModule : public ModuleManager::Instance {
 public:
-    BiDiRigctlClientModule(std::string name) {
+    RigSyncModule(std::string name) {
         this->name = name;
 
         // Load default
@@ -50,7 +50,7 @@ public:
         gui::menu.registerEntry(name, menuHandler, this, NULL);
     }
 
-    ~BiDiRigctlClientModule() {
+    ~RigSyncModule() {
         stop();
         gui::menu.removeEntry(name);
 
@@ -83,13 +83,15 @@ public:
             flog::error("Could not connect: {}", e.what());
             return;
         }
-
         // clear known state, the worker thread will handle synchronization
-        waterfallFrequency = -1;
+        // initialize our view of where the waterfall is at
+        double newFreq = gui::waterfall.getCenterFrequency();
+        newFreq += sigpath::vfoManager.getOffset(gui::waterfall.selectedVFO);
+        waterfallFrequency = newFreq;
         rigFrequency = -2;
 
         workerRunning = true;
-        workerThread = std::thread(&BiDiRigctlClientModule::worker, this);
+        workerThread = std::thread(&RigSyncModule::worker, this);
 
         running = true;
     }
@@ -115,29 +117,30 @@ public:
 
 private:
     static void menuHandler(void* ctx) {
-        BiDiRigctlClientModule* _this = (BiDiRigctlClientModule*)ctx;
+        RigSyncModule* _this = (RigSyncModule*)ctx;
         float menuWidth = ImGui::GetContentRegionAvail().x;
 
         if (_this->running) { style::beginDisabled(); }
-        if (ImGui::InputText(CONCAT("##_rigctl_cli_host_", _this->name), _this->host, 1023)) {
+        if (ImGui::InputText(CONCAT("##_rigsync_host_", _this->name), _this->host, 1023)) {
             config.acquire();
             config.conf[_this->name]["host"] = std::string(_this->host);
             config.release(true);
         }
         ImGui::SameLine();
         ImGui::SetNextItemWidth(menuWidth - ImGui::GetCursorPosX());
-        if (ImGui::InputInt(CONCAT("##_rigctl_cli_port_", _this->name), &_this->port, 0, 0)) {
+        if (ImGui::InputInt(CONCAT("##_rigsync_port_", _this->name), &_this->port, 0, 0)) {
             config.acquire();
             config.conf[_this->name]["port"] = _this->port;
             config.release(true);
         }
+        ImGui::InputInt(CONCAT("Poll period##_rigsync_poll_period_", _this->name), &_this->pollPeriod, 0, 0);
         if (_this->running) { style::endDisabled(); }
 
         ImGui::FillWidth();
-        if (_this->running && ImGui::Button(CONCAT("Stop##_rigctl_cli_stop_", _this->name), ImVec2(menuWidth, 0))) {
+        if (_this->running && ImGui::Button(CONCAT("Stop##_rigsync_stop_", _this->name), ImVec2(menuWidth, 0))) {
             _this->stop();
         }
-        else if (!_this->running && ImGui::Button(CONCAT("Start##_rigctl_cli_stop_", _this->name), ImVec2(menuWidth, 0))) {
+        else if (!_this->running && ImGui::Button(CONCAT("Start##_rigsync_stop_", _this->name), ImVec2(menuWidth, 0))) {
             _this->start();
         }
 
@@ -170,7 +173,7 @@ private:
             rigFrequency = newFreq;
             if(!almost_equal(rigFrequency, waterfallFrequency)) {
                 //TODO: handle multiple VFOs?
-                flog::info("tuning waterfall to {0}", rigFrequency);
+                flog::info("tuning waterfall from {0} to {1}", waterfallFrequency, rigFrequency);
                 tuner::tune(tuner::TUNER_MODE_NORMAL, gui::waterfall.selectedVFO, rigFrequency);
                 waterfallFrequency = rigFrequency;
             }
@@ -193,7 +196,7 @@ private:
         if(!almost_equal(waterfallFrequency, newFreq)) {
             waterfallFrequency = newFreq;
             if(!almost_equal(waterfallFrequency, rigFrequency)) {
-                flog::info("tuning radio to {0}", waterfallFrequency);
+                flog::info("tuning rig from {0} to {1}", rigFrequency, waterfallFrequency);
                 if (client->setFreq(waterfallFrequency)) {
                     flog::error("Could not set rig frequency");
                     return false;
@@ -220,7 +223,7 @@ private:
                     syncRigWithWaterfall();
                 }
             }
-            cv.wait_for(cv_lk, std::chrono::milliseconds(250));
+            cv.wait_for(cv_lk, std::chrono::milliseconds(pollPeriod));
         }
     }
 
@@ -231,6 +234,7 @@ private:
 
     char host[1024];
     int port = 4532;
+    int pollPeriod = 250;
     std::shared_ptr<net::rigctl::Client> client;
 
     double rigFrequency;
@@ -244,17 +248,17 @@ private:
 };
 
 MOD_EXPORT void _INIT_() {
-    config.setPath(core::args["root"].s() + "/sdrpp_rigctl_client_config.json");
+    config.setPath(core::args["root"].s() + "/sdrpp_rigsync_config.json");
     config.load(json::object());
     config.enableAutoSave();
 }
 
 MOD_EXPORT ModuleManager::Instance* _CREATE_INSTANCE_(std::string name) {
-    return new BiDiRigctlClientModule(name);
+    return new RigSyncModule(name);
 }
 
 MOD_EXPORT void _DELETE_INSTANCE_(void* instance) {
-    delete (BiDiRigctlClientModule*)instance;
+    delete (RigSyncModule*)instance;
 }
 
 MOD_EXPORT void _END_() {
