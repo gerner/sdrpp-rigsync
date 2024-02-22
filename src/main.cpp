@@ -45,13 +45,7 @@ public:
             port = config.conf[name]["port"];
             port = std::clamp<int>(port, 1, 65535);
         }
-        //if (config.conf[name].contains("ifFreq")) {
-        //    ifFreq = config.conf[name]["ifFreq"];
-        //}
         config.release();
-
-        //_retuneHandler.ctx = this;
-        //_retuneHandler.handler = retuneHandler;
 
         gui::menu.registerEntry(name, menuHandler, this, NULL);
     }
@@ -63,7 +57,6 @@ public:
     }
 
     void postInit() {
-        
     }
 
     void enable() {
@@ -98,11 +91,6 @@ public:
         workerRunning = true;
         workerThread = std::thread(&BiDiRigctlClientModule::worker, this);
 
-        // Switch source to panadapter mode
-        //sigpath::sourceManager.setPanadpterIF(ifFreq);
-        //sigpath::sourceManager.setTuningMode(SourceManager::TuningMode::PANADAPTER);
-        //sigpath::sourceManager.onRetune.bindHandler(&_retuneHandler);
-
         running = true;
     }
 
@@ -118,10 +106,6 @@ public:
             cv.notify_all();
             if (workerThread.joinable()) { workerThread.join(); }
         }
-
-        // Switch source back to normal mode
-        //sigpath::sourceManager.onRetune.unbindHandler(&_retuneHandler);
-        //sigpath::sourceManager.setTuningMode(SourceManager::TuningMode::NORMAL);
 
         // Disconnect from rigctl server
         client->close();
@@ -149,17 +133,6 @@ private:
         }
         if (_this->running) { style::endDisabled(); }
 
-        /*ImGui::LeftLabel("IF Frequency");
-        ImGui::FillWidth();
-        if (ImGui::InputDouble(CONCAT("##_rigctl_if_freq_", _this->name), &_this->ifFreq, 100.0, 100000.0, "%.0f")) {
-            if (_this->running) {
-                //sigpath::sourceManager.setPanadpterIF(_this->ifFreq);
-            }
-            config.acquire();
-            config.conf[_this->name]["ifFreq"] = _this->ifFreq;
-            config.release(true);
-        }*/
-
         ImGui::FillWidth();
         if (_this->running && ImGui::Button(CONCAT("Stop##_rigctl_cli_stop_", _this->name), ImVec2(menuWidth, 0))) {
             _this->stop();
@@ -185,19 +158,6 @@ private:
         }
     }
 
-    /*static void retuneHandler(double freq, void* ctx) {
-        flog::info("retune {0}", freq);
-        BiDiRigctlClientModule* _this = (BiDiRigctlClientModule*)ctx;
-        std::lock_guard<std::recursive_mutex> lck(_this->mtx);
-        _this->waterfallFrequency = freq;
-        if (!_this->client || !_this->client->isOpen()) { return; }
-        if (almost_equal(_this->waterfallFrequency, _this->rigFrequency)) { return; }
-        flog::info("tuning rig to {0}", freq);
-        if (_this->client->setFreq(freq)) {
-            flog::error("Could not set frequency");
-        }
-    }*/
-
     bool syncWaterfallWithRig() {
         //checks if we have a new rig frequency and sets the waterfall to that
 
@@ -210,17 +170,6 @@ private:
             rigFrequency = newFreq;
             if(!almost_equal(rigFrequency, waterfallFrequency)) {
                 //TODO: handle multiple VFOs?
-                //TODO: what's the right way to use ifFreq?
-                // we don't know what the radio's actual IF freq is
-                // so we're just approximating it
-                // this feels janky
-                /*if(abs(rigFrequency - ifFreq) > 500000) {
-                    ifFreq = rigFrequency;
-                    sigpath::sourceManager.setPanadpterIF(ifFreq);
-                    config.acquire();
-                    config.conf[name]["ifFreq"] = ifFreq;
-                    config.release(true);
-                }*/
                 flog::info("tuning waterfall to {0}", rigFrequency);
                 tuner::tune(tuner::TUNER_MODE_NORMAL, gui::waterfall.selectedVFO, rigFrequency);
                 waterfallFrequency = rigFrequency;
@@ -283,10 +232,6 @@ private:
     char host[1024];
     int port = 4532;
     std::shared_ptr<net::rigctl::Client> client;
-
-    //double ifFreq = 8830000.0;
-
-    //EventHandler<double> _retuneHandler;
 
     double rigFrequency;
     double waterfallFrequency;
