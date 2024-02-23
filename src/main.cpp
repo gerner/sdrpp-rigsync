@@ -173,8 +173,15 @@ private:
             rigFrequency = newFreq;
             if(!almost_equal(rigFrequency, waterfallFrequency)) {
                 //TODO: handle multiple VFOs?
-                flog::info("tuning waterfall from {0} to {1}", waterfallFrequency, rigFrequency);
+                flog::info("tuning waterfall from {0} to {1} with vfo {2}", waterfallFrequency, rigFrequency, gui::waterfall.selectedVFO);
+                double oldWaterfallCenter = gui::waterfall.getCenterFrequency();
                 tuner::tune(tuner::TUNER_MODE_NORMAL, gui::waterfall.selectedVFO, rigFrequency);
+                // if we switch bands, sometimes the sdr doesn't get retuned
+                // so let's do that so the sdr is always centered on the
+                // waterfall
+                if(gui::waterfall.getCenterFrequency() != oldWaterfallCenter) {
+                    sigpath::sourceManager.tune(gui::waterfall.getCenterFrequency());
+                }
                 waterfallFrequency = rigFrequency;
             }
         } // else there's no change in rig freq, assume we're in sync
