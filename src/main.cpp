@@ -227,6 +227,10 @@ private:
                 std::lock_guard<std::recursive_mutex> lck(mtx);
                 if (!client || !client->isOpen()) {
                     flog::error("client is not open, stopping sync thread");
+                    // client is already closed, we're about to stop, so just
+                    // mark running as false to be stopped, user can restart us
+                    workerRunning = false;
+                    running=false;
                     break;
                 }
                 if(running) {
