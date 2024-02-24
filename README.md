@@ -2,6 +2,9 @@
 
 Synchronize your rig and your waterfall with this rigctrl module for [SDR++](https://github.com/AlexandreRouma/SDRPlusPlus).
 
+This module works if your SDR is not connected via an IF tap. That is, the SDR
+can be tuned independently of your rig.
+
 # Building
 
 1. Download the SDR++ source code: `git clone https://github.com/AlexandreRouma/SDRPlusPlus`
