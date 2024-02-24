@@ -180,7 +180,7 @@ private:
                 // so let's do that so the sdr is always centered on the
                 // waterfall
                 if(gui::waterfall.getCenterFrequency() != oldWaterfallCenter) {
-                    sigpath::sourceManager.tune(gui::waterfall.getCenterFrequency());
+                    tuner::tune(tuner::TUNER_MODE_CENTER, gui::waterfall.selectedVFO, rigFrequency);
                 }
                 waterfallFrequency = rigFrequency;
             }
@@ -225,6 +225,10 @@ private:
             {
                 // synchronize state with the rig
                 std::lock_guard<std::recursive_mutex> lck(mtx);
+                if (!client || !client->isOpen()) {
+                    flog::error("client is not open, stopping sync thread");
+                    break;
+                }
                 if(running) {
                     syncWaterfallWithRig();
                     syncRigWithWaterfall();
