@@ -11,6 +11,7 @@
 #include <core.h>
 #include <config.h>
 #include <cctype>
+#include <radio_interface.h>
 #define CONCAT(a, b) ((std::string(a) + b).c_str())
 
 SDRPP_MOD_INFO{
@@ -23,6 +24,38 @@ SDRPP_MOD_INFO{
 
 bool almost_equal(double a, double b, double epsilon=1e-3) {
     return abs(a-b) < epsilon;
+}
+
+std::map<int, net::rigctl::Mode> radioModeToRigctlMode = {
+    { RADIO_IFACE_MODE_NFM, net::rigctl::MODE_FM },
+    { RADIO_IFACE_MODE_WFM, net::rigctl::MODE_WFM },
+    { RADIO_IFACE_MODE_AM, net::rigctl::MODE_AM },
+    { RADIO_IFACE_MODE_DSB, net::rigctl::MODE_DSB },
+    { RADIO_IFACE_MODE_USB, net::rigctl::MODE_USB },
+    { RADIO_IFACE_MODE_CW, net::rigctl::MODE_CW },
+    { RADIO_IFACE_MODE_LSB, net::rigctl::MODE_LSB },
+};
+
+net::rigctl::Mode getWaterfallMode(std::string vfoName) {
+    int radioModuleMode;
+    core::modComManager.callInterface(vfoName, RADIO_IFACE_CMD_GET_MODE, NULL, &radioModuleMode);
+    auto it = radioModeToRigctlMode.find(radioModuleMode);
+    if (radioModeToRigctlMode.end() == it) {
+        return net::rigctl::MODE_INVALID;
+    }
+    return it->second;
+}
+
+bool setWaterfallMode(std::string vfoName, net::rigctl::Mode newMode) {
+    auto it = std::find_if(radioModeToRigctlMode.begin(), radioModeToRigctlMode.end(), [&newMode](const auto& e) {
+        return e.second == newMode;
+    });
+    if (it == radioModeToRigctlMode.end()) {
+        return false;
+    }
+    int mode = it->first;
+    core::modComManager.callInterface(gui::waterfall.selectedVFO, RADIO_IFACE_CMD_SET_MODE, &mode, NULL);
+    return true;
 }
 
 ConfigManager config;
@@ -72,6 +105,7 @@ public:
     }
 
     void start() {
+        std::unique_lock cv_lk(workerMutex);
         std::lock_guard<std::recursive_mutex> lck(mtx);
         if (running) { return; }
 
@@ -84,35 +118,33 @@ public:
             return;
         }
         // clear known state, the worker thread will handle synchronization
+        workerErrors = 0;
         // initialize our view of where the waterfall is at
         double newFreq = gui::waterfall.getCenterFrequency();
         newFreq += sigpath::vfoManager.getOffset(gui::waterfall.selectedVFO);
         waterfallFrequency = newFreq;
         rigFrequency = -2;
 
-        workerRunning = true;
-        workerThread = std::thread(&RigSyncModule::worker, this);
+        //TODO: initialize mode/passband state
 
+        // join old thread if it killed itself
+        if (workerThread.joinable()) { workerThread.join(); }
+        workerThread = std::thread(&RigSyncModule::worker, this);
         running = true;
     }
 
     void stop() {
+        std::unique_lock cv_lk(workerMutex);
         std::lock_guard<std::recursive_mutex> lck(mtx);
         if (!running) { return; }
 
         // let worker know we're shutting down
-        {
-            std::unique_lock cv_lk(workerMutex);
-            workerRunning = false;
-            cv_lk.unlock();
-            cv.notify_all();
-            if (workerThread.joinable()) { workerThread.join(); }
-        }
-
+        cv_lk.unlock();
+        cv.notify_all();
+        running = false;
+        if (workerThread.joinable()) { workerThread.join(); }
         // Disconnect from rigctl server
         client->close();
-
-        running = false;
     }
 
 private:
@@ -162,8 +194,6 @@ private:
     }
 
     bool syncWaterfallWithRig() {
-        //checks if we have a new rig frequency and sets the waterfall to that
-
         // synchronize rig -> waterfall
         double newFreq = client->getFreq();
         if(newFreq < 0) {
@@ -185,15 +215,51 @@ private:
                 waterfallFrequency = rigFrequency;
             }
         } // else there's no change in rig freq, assume we're in sync
+
         if(waterfallFrequency != rigFrequency) {
             flog::error("waterfall and rig are out of sync!");
         }
+
+#ifdef GERNER_PROTO_RIGCTL // SDR++ official doesn't implement rigctl get/setMode, but I have a fork that does
+        //synchronize mode
+        int newPassband;
+        net::rigctl::Mode newMode = client->getMode(&newPassband);
+        if (net::rigctl::MODE_INVALID == newMode) {
+            // TODO: differentiate an error getting the mode vs the radio
+            // having a mode our rigctl client doesn't understand
+            flog::error("Could not get mode from radio");
+            return false;
+        } else {
+            if (newMode != rigMode) {
+                rigMode = newMode;
+                if (rigMode != waterfallMode) {
+                    flog::info("changing sdr++ radio mode from {0} to {1}", (int)waterfallMode, (int)rigMode);
+                    if(setWaterfallMode(gui::waterfall.selectedVFO, rigMode)) {
+                        waterfallMode = rigMode;
+                    } else {
+                        flog::error("error setting waterfall mode to {}", (int)rigMode);
+                    }
+                }
+            }
+            if (newPassband != rigPassband) {
+                rigPassband = newPassband;
+                if (!almost_equal(rigPassband, waterfallPassband)) {
+                    flog::info("changing sdr++ radio passband from {0} to {1}", waterfallPassband, rigPassband);
+                    if (rigPassband > 0) {
+                        core::modComManager.callInterface(gui::waterfall.selectedVFO, RADIO_IFACE_CMD_SET_BANDWIDTH, &rigPassband, NULL);
+                        waterfallPassband = rigPassband;
+                    } else {
+                        flog::error("got unexpected passband from rig {0}", rigPassband);
+                    }
+                }
+            }
+        }
+#endif //GERNER_PROTO_RIGCTL
+
         return true;
     }
 
     bool syncRigWithWaterfall() {
-        //checks if we have a new waterfall frequency and sets the rig to that
-
         // from rigctl_server
         // Get center frequency of the SDR
         double newFreq = gui::waterfall.getCenterFrequency();
@@ -211,17 +277,39 @@ private:
                 rigFrequency = waterfallFrequency;
             }
         } // else there's no change in waterfall freq, assume we're in sync
+
         if(waterfallFrequency != rigFrequency) {
             flog::error("waterfall and rig are out of sync!");
         }
+
+#ifdef GERNER_PROTO_RIGCTL // SDR++ official doesn't implement rigctl get/setMode, but I have a fork that does
+        // synchronize mode and passband
+        net::rigctl::Mode newMode = getWaterfallMode(gui::waterfall.selectedVFO);
+        if (newMode == net::rigctl::MODE_INVALID) {
+            flog::error("waterfall had invalid mode");
+            return false;
+        } else {
+            float radioPassband;
+            core::modComManager.callInterface(gui::waterfall.selectedVFO, RADIO_IFACE_CMD_GET_BANDWIDTH, NULL, &radioPassband);
+            int newPassband = radioPassband;
+            if (newMode != waterfallMode || newPassband != waterfallPassband) {
+                waterfallMode = newMode;
+                waterfallPassband = newPassband;
+                if (waterfallMode != rigMode || waterfallPassband != rigPassband) {
+                    client->setMode(waterfallMode, waterfallPassband);
+                }
+            }
+        }
+#endif //GERNER_PROTO_RIGCTL
         return true;
     }
 
     void worker() {
+        flog::info("rigsync worker starting");
         // this is a pure polling approach: we poll both the rig and the
         // waterfall for changes since the last time we checked
         std::unique_lock cv_lk(workerMutex);
-        while (workerRunning) {
+        while (running) {
             {
                 // synchronize state with the rig
                 std::lock_guard<std::recursive_mutex> lck(mtx);
@@ -229,17 +317,29 @@ private:
                     flog::error("client is not open, stopping sync thread");
                     // client is already closed, we're about to stop, so just
                     // mark running as false to be stopped, user can restart us
-                    workerRunning = false;
                     running=false;
                     break;
                 }
                 if(running) {
-                    syncWaterfallWithRig();
-                    syncRigWithWaterfall();
+                    bool success = true;
+                    success = success && syncWaterfallWithRig();
+                    success = success && syncRigWithWaterfall();
+                    if (!success) {
+                        workerErrors +=1;
+                        if (workerErrors > maxWorkerErrors) {
+                            flog::error("too many worker errors, stopping.");
+                            client->close();
+                            running = false;
+                            break;
+                        }
+                    } else {
+                        workerErrors = 0;
+                    }
                 }
             }
             cv.wait_for(cv_lk, std::chrono::milliseconds(pollPeriod));
         }
+        flog::info("rigsync worker stopping");
     }
 
     std::string name;
@@ -255,11 +355,18 @@ private:
     double rigFrequency;
     double waterfallFrequency;
 
+    net::rigctl::Mode rigMode;
+    net::rigctl::Mode waterfallMode;
+
+    float rigPassband;
+    float waterfallPassband;
+
     // Threading
     std::thread workerThread;
-    bool workerRunning;
     std::condition_variable cv;
     std::mutex workerMutex;
+    int workerErrors=0;
+    int maxWorkerErrors=16;
 };
 
 MOD_EXPORT void _INIT_() {
