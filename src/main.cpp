@@ -78,6 +78,11 @@ public:
             port = config.conf[name]["port"];
             port = std::clamp<int>(port, 1, 65535);
         }
+#ifdef GERNER_PROTO_RIGCTL
+        if (config.conf[name].contains("syncMode")) {
+            syncMode = config.conf[name]["syncMode"];
+        }
+#endif
         config.release();
 
         gui::menu.registerEntry(name, menuHandler, this, NULL);
@@ -168,6 +173,17 @@ private:
         ImGui::InputInt(CONCAT("Poll period##_rigsync_poll_period_", _this->name), &_this->pollPeriod, 0, 0);
         if (_this->running) { style::endDisabled(); }
 
+#ifdef GERNER_PROTO_RIGCTL
+        {
+            std::lock_guard<std::recursive_mutex> lck(_this->mtx);
+            if (ImGui::Checkbox(CONCAT("Sync mode##_rigsync_sync_mode__", _this->name), &_this->syncMode)) {
+                config.acquire();
+                config.conf[_this->name]["syncMode"] = _this->syncMode;
+                config.release();
+            }
+        }
+#endif
+
         ImGui::FillWidth();
         if (_this->running && ImGui::Button(CONCAT("Stop##_rigsync_stop_", _this->name), ImVec2(menuWidth, 0))) {
             _this->stop();
@@ -222,34 +238,36 @@ private:
 
 #ifdef GERNER_PROTO_RIGCTL // SDR++ official doesn't implement rigctl get/setMode, but I have a fork that does
         //synchronize mode
-        int newPassband;
-        net::rigctl::Mode newMode = client->getMode(&newPassband);
-        if (net::rigctl::MODE_INVALID == newMode) {
-            // TODO: differentiate an error getting the mode vs the radio
-            // having a mode our rigctl client doesn't understand
-            flog::error("Could not get mode from radio");
-            return false;
-        } else {
-            if (newMode != rigMode) {
-                rigMode = newMode;
-                if (rigMode != waterfallMode) {
-                    flog::info("changing sdr++ radio mode from {0} to {1}", (int)waterfallMode, (int)rigMode);
-                    if(setWaterfallMode(gui::waterfall.selectedVFO, rigMode)) {
-                        waterfallMode = rigMode;
-                    } else {
-                        flog::error("error setting waterfall mode to {}", (int)rigMode);
+        if (syncMode) {
+            int newPassband;
+            net::rigctl::Mode newMode = client->getMode(&newPassband);
+            if (net::rigctl::MODE_INVALID == newMode) {
+                // TODO: differentiate an error getting the mode vs the radio
+                // having a mode our rigctl client doesn't understand
+                flog::error("Could not get mode from radio");
+                return false;
+            } else {
+                if (newMode != rigMode) {
+                    rigMode = newMode;
+                    if (rigMode != waterfallMode) {
+                        flog::info("changing sdr++ radio mode from {0} to {1}", (int)waterfallMode, (int)rigMode);
+                        if(setWaterfallMode(gui::waterfall.selectedVFO, rigMode)) {
+                            waterfallMode = rigMode;
+                        } else {
+                            flog::error("error setting waterfall mode to {}", (int)rigMode);
+                        }
                     }
                 }
-            }
-            if (newPassband != rigPassband) {
-                rigPassband = newPassband;
-                if (!almost_equal(rigPassband, waterfallPassband)) {
-                    flog::info("changing sdr++ radio passband from {0} to {1}", waterfallPassband, rigPassband);
-                    if (rigPassband > 0) {
-                        core::modComManager.callInterface(gui::waterfall.selectedVFO, RADIO_IFACE_CMD_SET_BANDWIDTH, &rigPassband, NULL);
-                        waterfallPassband = rigPassband;
-                    } else {
-                        flog::error("got unexpected passband from rig {0}", rigPassband);
+                if (newPassband != rigPassband) {
+                    rigPassband = newPassband;
+                    if (!almost_equal(rigPassband, waterfallPassband)) {
+                        flog::info("changing sdr++ radio passband from {0} to {1}", waterfallPassband, rigPassband);
+                        if (rigPassband > 0) {
+                            core::modComManager.callInterface(gui::waterfall.selectedVFO, RADIO_IFACE_CMD_SET_BANDWIDTH, &rigPassband, NULL);
+                            waterfallPassband = rigPassband;
+                        } else {
+                            flog::error("got unexpected passband from rig {0}", rigPassband);
+                        }
                     }
                 }
             }
@@ -283,20 +301,22 @@ private:
         }
 
 #ifdef GERNER_PROTO_RIGCTL // SDR++ official doesn't implement rigctl get/setMode, but I have a fork that does
-        // synchronize mode and passband
-        net::rigctl::Mode newMode = getWaterfallMode(gui::waterfall.selectedVFO);
-        if (newMode == net::rigctl::MODE_INVALID) {
-            flog::error("waterfall had invalid mode");
-            return false;
-        } else {
-            float radioPassband;
-            core::modComManager.callInterface(gui::waterfall.selectedVFO, RADIO_IFACE_CMD_GET_BANDWIDTH, NULL, &radioPassband);
-            int newPassband = radioPassband;
-            if (newMode != waterfallMode || newPassband != waterfallPassband) {
-                waterfallMode = newMode;
-                waterfallPassband = newPassband;
-                if (waterfallMode != rigMode || waterfallPassband != rigPassband) {
-                    client->setMode(waterfallMode, waterfallPassband);
+        if (syncMode) {
+            // synchronize mode and passband
+            net::rigctl::Mode newMode = getWaterfallMode(gui::waterfall.selectedVFO);
+            if (newMode == net::rigctl::MODE_INVALID) {
+                flog::error("waterfall had invalid mode");
+                return false;
+            } else {
+                float radioPassband;
+                core::modComManager.callInterface(gui::waterfall.selectedVFO, RADIO_IFACE_CMD_GET_BANDWIDTH, NULL, &radioPassband);
+                int newPassband = radioPassband;
+                if (newMode != waterfallMode || newPassband != waterfallPassband) {
+                    waterfallMode = newMode;
+                    waterfallPassband = newPassband;
+                    if (waterfallMode != rigMode || waterfallPassband != rigPassband) {
+                        client->setMode(waterfallMode, waterfallPassband);
+                    }
                 }
             }
         }
@@ -350,6 +370,9 @@ private:
     char host[1024];
     int port = 4532;
     int pollPeriod = 250;
+#ifdef GERNER_PROTO_RIGCTL
+    bool syncMode = true;
+#endif
     std::shared_ptr<net::rigctl::Client> client;
 
     double rigFrequency;
