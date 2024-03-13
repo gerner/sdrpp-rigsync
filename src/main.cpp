@@ -176,7 +176,7 @@ private:
 #ifdef GERNER_PROTO_RIGCTL
         {
             std::lock_guard<std::recursive_mutex> lck(_this->mtx);
-            if (ImGui::Checkbox(CONCAT("Sync mode##_rigsync_sync_mode__", _this->name), &_this->syncMode)) {
+            if (ImGui::Checkbox(CONCAT("Sync radio mode##_rigsync_sync_mode__", _this->name), &_this->syncMode)) {
                 config.acquire();
                 config.conf[_this->name]["syncMode"] = _this->syncMode;
                 config.release();
